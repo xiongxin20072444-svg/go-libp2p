@@ -40,6 +40,20 @@ var ErrClosed = errors.New("hole punching service closing")
 
 type Option func(*Service) error
 
+// DirectConnectionValidator verifies that an existing direct connection can
+// still carry traffic before DCUtR treats it as already connected.
+type DirectConnectionValidator func(context.Context, network.Conn) error
+
+func WithDirectConnectionValidator(validator DirectConnectionValidator) Option {
+	return func(s *Service) error {
+		if validator == nil {
+			return errors.New("direct connection validator can't be nil")
+		}
+		s.directConnectionValidator = validator
+		return nil
+	}
+}
+
 func DirectDialTimeout(timeout time.Duration) Option {
 	return func(s *Service) error {
 		s.directDialTimeout = timeout
@@ -61,9 +75,10 @@ type Service struct {
 	// publicly reachable relay addresses.
 	listenAddrs func() []ma.Multiaddr
 
-	directDialTimeout time.Duration
-	holePuncherMx     sync.Mutex
-	holePuncher       *holePuncher
+	directDialTimeout         time.Duration
+	directConnectionValidator DirectConnectionValidator
+	holePuncherMx             sync.Mutex
+	holePuncher               *holePuncher
 
 	hasPublicAddrsChan chan struct{}
 
@@ -147,7 +162,14 @@ func (s *Service) waitForPublicAddr() {
 		// service is closed
 		return
 	}
-	s.holePuncher = newHolePuncher(s.host, s.ids, s.listenAddrs, s.tracer, s.filter)
+	s.holePuncher = newHolePuncher(
+		s.host,
+		s.ids,
+		s.listenAddrs,
+		s.tracer,
+		s.filter,
+		s.directConnectionValidator,
+	)
 	s.holePuncher.directDialTimeout = s.directDialTimeout
 	s.holePuncherMx.Unlock()
 	close(s.hasPublicAddrsChan)

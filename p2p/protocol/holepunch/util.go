@@ -40,12 +40,21 @@ func addrsFromBytes(bzs [][]byte) []ma.Multiaddr {
 }
 
 func getDirectConnection(h host.Host, p peer.ID) network.Conn {
+	direct := getDirectConnections(h, p)
+	if len(direct) == 0 {
+		return nil
+	}
+	return direct[0]
+}
+
+func getDirectConnections(h host.Host, p peer.ID) []network.Conn {
+	var direct []network.Conn
 	for _, c := range h.Network().ConnsToPeer(p) {
 		if !isRelayAddress(c.RemoteMultiaddr()) {
-			return c
+			direct = append(direct, c)
 		}
 	}
-	return nil
+	return direct
 }
 
 func holePunchConnect(ctx context.Context, host host.Host, pi peer.AddrInfo, isClient bool) error {

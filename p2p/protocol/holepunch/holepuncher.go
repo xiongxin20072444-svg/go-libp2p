@@ -42,22 +42,37 @@ type holePuncher struct {
 	// active hole punches for deduplicating
 	activeMx sync.Mutex
 	active   map[peer.ID]struct{}
+	// A relay reconnect that arrives during an active attempt represents newer
+	// connectivity information. Coalesce any burst into one bounded replay.
+	pending   map[peer.ID]struct{}
+	replaying map[peer.ID]struct{}
 
 	closeMx sync.RWMutex
 	closed  bool
 
-	tracer *tracer
-	filter AddrFilter
+	tracer                    *tracer
+	filter                    AddrFilter
+	directConnectionValidator DirectConnectionValidator
 }
 
-func newHolePuncher(h host.Host, ids identify.IDService, listenAddrs func() []ma.Multiaddr, tracer *tracer, filter AddrFilter) *holePuncher {
+func newHolePuncher(
+	h host.Host,
+	ids identify.IDService,
+	listenAddrs func() []ma.Multiaddr,
+	tracer *tracer,
+	filter AddrFilter,
+	directConnectionValidator DirectConnectionValidator,
+) *holePuncher {
 	hp := &holePuncher{
-		host:        h,
-		ids:         ids,
-		active:      make(map[peer.ID]struct{}),
-		tracer:      tracer,
-		filter:      filter,
-		listenAddrs: listenAddrs,
+		host:                      h,
+		ids:                       ids,
+		active:                    make(map[peer.ID]struct{}),
+		pending:                   make(map[peer.ID]struct{}),
+		replaying:                 make(map[peer.ID]struct{}),
+		tracer:                    tracer,
+		filter:                    filter,
+		listenAddrs:               listenAddrs,
+		directConnectionValidator: directConnectionValidator,
 	}
 	hp.ctx, hp.ctxCancel = context.WithCancel(context.Background())
 	h.Network().Notify((*netNotifiee)(hp))
@@ -78,7 +93,85 @@ func (hp *holePuncher) beginDirectConnect(p peer.ID) error {
 	}
 
 	hp.active[p] = struct{}{}
+	delete(hp.pending, p)
+	delete(hp.replaying, p)
 	return nil
+}
+
+// beginOrQueueDirectConnect starts the first relay-triggered attempt and keeps
+// at most one newer trigger while it is active. Triggers received during the
+// replay are intentionally dropped so repeated relay connections cannot build
+// an unbounded retry chain.
+func (hp *holePuncher) beginOrQueueDirectConnect(p peer.ID) (bool, error) {
+	hp.closeMx.RLock()
+	defer hp.closeMx.RUnlock()
+	if hp.closed {
+		return false, ErrClosed
+	}
+
+	hp.activeMx.Lock()
+	defer hp.activeMx.Unlock()
+	if _, ok := hp.active[p]; ok {
+		if _, replaying := hp.replaying[p]; !replaying {
+			if hp.pending == nil {
+				hp.pending = make(map[peer.ID]struct{})
+			}
+			hp.pending[p] = struct{}{}
+		}
+		return false, nil
+	}
+
+	if hp.active == nil {
+		hp.active = make(map[peer.ID]struct{})
+	}
+	if hp.replaying == nil {
+		hp.replaying = make(map[peer.ID]struct{})
+	}
+	hp.active[p] = struct{}{}
+	delete(hp.pending, p)
+	delete(hp.replaying, p)
+	return true, nil
+}
+
+// finishDirectConnect returns true exactly once when a newer relay trigger was
+// coalesced. The peer remains active while that replay runs.
+func (hp *holePuncher) finishDirectConnect(p peer.ID) bool {
+	hp.closeMx.RLock()
+	closed := hp.closed
+	hp.closeMx.RUnlock()
+
+	hp.activeMx.Lock()
+	defer hp.activeMx.Unlock()
+	if !closed {
+		if _, pending := hp.pending[p]; pending {
+			if _, replaying := hp.replaying[p]; !replaying {
+				delete(hp.pending, p)
+				hp.replaying[p] = struct{}{}
+				return true
+			}
+		}
+	}
+	delete(hp.active, p)
+	delete(hp.pending, p)
+	delete(hp.replaying, p)
+	return false
+}
+
+func (hp *holePuncher) isDirectConnectActive(p peer.ID) bool {
+	hp.activeMx.Lock()
+	defer hp.activeMx.Unlock()
+	_, ok := hp.active[p]
+	return ok
+}
+
+func (hp *holePuncher) runDirectConnectRequests(p peer.ID) error {
+	for {
+		err := hp.directConnect(p)
+		if !hp.finishDirectConnect(p) {
+			return err
+		}
+		log.Debug("running coalesced DirectConnect trigger", "remote_peer", p)
+	}
 }
 
 // DirectConnect attempts to make a direct connection with a remote peer.
@@ -90,20 +183,40 @@ func (hp *holePuncher) DirectConnect(p peer.ID) error {
 		return err
 	}
 
-	defer func() {
-		hp.activeMx.Lock()
-		delete(hp.active, p)
-		hp.activeMx.Unlock()
-	}()
-
-	return hp.directConnect(p)
+	return hp.runDirectConnectRequests(p)
 }
 
 func (hp *holePuncher) directConnect(rp peer.ID) error {
 	// short-circuit check to see if we already have a direct connection
-	if getDirectConnection(hp.host, rp) != nil {
-		log.Debug("already connected", "source_peer", hp.host.ID(), "destination_peer", rp)
-		return nil
+	directConnections := getDirectConnections(hp.host, rp)
+	if len(directConnections) > 0 {
+		if hp.directConnectionValidator == nil {
+			log.Debug("already connected", "source_peer", hp.host.ID(), "destination_peer", rp)
+			return nil
+		}
+		for _, direct := range directConnections {
+			if err := hp.directConnectionValidator(hp.ctx, direct); err == nil {
+				log.Debug("existing direct connection verified", "source_peer", hp.host.ID(), "destination_peer", rp, "connection_id", direct.ID())
+				return nil
+			} else {
+				log.Debug(
+					"retiring unresponsive direct connection before hole punch",
+					"source_peer", hp.host.ID(),
+					"destination_peer", rp,
+					"connection_id", direct.ID(),
+					"err", err,
+				)
+				if closeErr := direct.Close(); closeErr != nil {
+					log.Debug(
+						"failed to close unresponsive direct connection",
+						"source_peer", hp.host.ID(),
+						"destination_peer", rp,
+						"connection_id", direct.ID(),
+						"err", closeErr,
+					)
+				}
+			}
+		}
 	}
 
 	log.Debug("attempting direct dial", "source_peer", hp.host.ID(), "destination_peer", rp, "addrs", hp.host.Peerstore().Addrs(rp))
@@ -290,7 +403,17 @@ func (nn *netNotifiee) Connected(_ network.Network, conn network.Conn) {
 				return
 			}
 
-			err := hs.DirectConnect(conn.RemotePeer())
+			started, err := hs.beginOrQueueDirectConnect(conn.RemotePeer())
+			if err != nil {
+				log.Debug("attempt to schedule DirectConnect failed", "remote_peer", conn.RemotePeer(), "err", err)
+				return
+			}
+			if !started {
+				log.Debug("coalesced DirectConnect trigger", "remote_peer", conn.RemotePeer())
+				return
+			}
+
+			err = hs.runDirectConnectRequests(conn.RemotePeer())
 			if err != nil {
 				log.Debug("attempt to perform DirectConnect failed", "remote_peer", conn.RemotePeer(), "err", err)
 			}
