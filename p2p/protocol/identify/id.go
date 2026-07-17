@@ -118,6 +118,28 @@ type IDService interface {
 	io.Closer
 }
 
+// FreshIDService is an optional extension for callers that need a new,
+// side-effect-free Identify snapshot from a concrete connection.
+type FreshIDService interface {
+	IdentifyConnFresh(context.Context, network.Conn) (FreshIdentifySnapshot, error)
+}
+
+var _ FreshIDService = (*idService)(nil)
+
+var ErrIdentifyConnectionUnavailable = errors.New("identify connection is no longer available")
+
+// FreshIdentifySnapshot is the side-effect-free result of one Identify
+// exchange on a concrete authenticated connection.
+type FreshIdentifySnapshot struct {
+	PeerID          peer.ID
+	ConnectionID    string
+	ListenAddrs     []ma.Multiaddr
+	ObservedAddr    ma.Multiaddr
+	Protocols       []protocol.ID
+	ProtocolVersion string
+	AgentVersion    string
+}
+
 type identifyPushSupport uint8
 
 const (
@@ -136,6 +158,17 @@ type entry struct {
 	PushSupport identifyPushSupport
 	// Sequence is the sequence number of the last snapshot we sent to this peer.
 	Sequence uint64
+
+	FreshState *freshIdentifyConnectionState
+}
+
+type freshIdentifyConnectionState struct {
+	gate sync.Mutex
+
+	ctx     context.Context
+	cancel  context.CancelFunc
+	retired bool
+	token   chan struct{}
 }
 
 // idService is a structure that implements ProtocolIdentify.
@@ -157,7 +190,12 @@ type idService struct {
 	ctx            context.Context
 	ctxCancel      context.CancelFunc
 	// track resources that need to be shut down before we shut down
-	refCount sync.WaitGroup
+	refCount       sync.WaitGroup
+	freshLifecycle struct {
+		sync.Mutex
+		closed bool
+		active sync.WaitGroup
+	}
 
 	disableSignedPeerRecord bool
 	timeout                 time.Duration
@@ -359,7 +397,11 @@ func (ids *idService) sendPushes(ctx context.Context) {
 
 // Close shuts down the idService
 func (ids *idService) Close() error {
+	ids.freshLifecycle.Lock()
+	ids.freshLifecycle.closed = true
 	ids.ctxCancel()
+	ids.freshLifecycle.Unlock()
+	ids.freshLifecycle.active.Wait()
 	ids.refCount.Wait()
 	return nil
 }
@@ -390,6 +432,7 @@ func (ids *idService) IdentifyWait(c network.Conn) <-chan struct{} {
 			return ch
 		} else {
 			ids.addConnWithLock(c)
+			e = ids.conns[c]
 		}
 	}
 
@@ -413,6 +456,233 @@ func (ids *idService) IdentifyWait(c network.Conn) <-chan struct{} {
 	}()
 
 	return e.IdentifyWaitChan
+}
+
+// IdentifyConnFresh runs a new Identify exchange on an already tracked connection.
+// The response is delivered only after the initial Identify has completed and
+// while this exact connection is still current in the service.
+func (ids *idService) IdentifyConnFresh(ctx context.Context, c network.Conn) (FreshIdentifySnapshot, error) {
+	if ctx == nil {
+		return FreshIdentifySnapshot{}, errors.New("identify fresh context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return FreshIdentifySnapshot{}, err
+	}
+	ids.freshLifecycle.Lock()
+	if ids.freshLifecycle.closed {
+		ids.freshLifecycle.Unlock()
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+	ids.freshLifecycle.active.Add(1)
+	ids.freshLifecycle.Unlock()
+	defer ids.freshLifecycle.active.Done()
+
+	operationCtx, cancelOperation := context.WithCancel(ctx)
+	stopServiceCancellation := context.AfterFunc(ids.ctx, cancelOperation)
+	defer stopServiceCancellation()
+	defer cancelOperation()
+
+	if c == nil || c.IsClosed() {
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+	binding := freshIdentifyConnectionBinding{
+		connection:   c,
+		connectionID: c.ID(),
+		localPeer:    c.LocalPeer(),
+		remotePeer:   c.RemotePeer(),
+	}
+
+	ids.connsMu.RLock()
+	e, ok := ids.conns[c]
+	ids.connsMu.RUnlock()
+	if !ok || e.FreshState == nil {
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+	binding.state = e.FreshState
+	if !binding.valid() {
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+	stopConnectionCancellation := context.AfterFunc(binding.state.ctx, cancelOperation)
+	defer stopConnectionCancellation()
+
+	select {
+	case <-operationCtx.Done():
+		return FreshIdentifySnapshot{}, ids.freshOperationError(ctx, operationCtx, binding.state)
+	case <-binding.state.token:
+	}
+	defer func() { binding.state.token <- struct{}{} }()
+
+	select {
+	case <-operationCtx.Done():
+		return FreshIdentifySnapshot{}, ids.freshOperationError(ctx, operationCtx, binding.state)
+	case <-ids.IdentifyWait(c):
+	}
+	if !ids.isTrackedFreshBinding(binding) {
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+
+	requestCtx, cancel := context.WithTimeout(operationCtx, ids.timeout)
+	defer cancel()
+	stream, err := newStreamAndNegotiate(network.WithAllowLimitedConn(requestCtx, "identify"), c, ID, ids.timeout)
+	if err != nil {
+		if requestErr := requestCtx.Err(); requestErr != nil {
+			return FreshIdentifySnapshot{}, ids.freshOperationError(ctx, requestCtx, binding.state)
+		}
+		return FreshIdentifySnapshot{}, err
+	}
+	defer stream.Close()
+
+	delivery := &freshIdentifyDeliveryState{}
+	stopCancellation := context.AfterFunc(requestCtx, func() {
+		binding.state.gate.Lock()
+		delivery.cancelled = true
+		binding.state.gate.Unlock()
+		_ = stream.Reset()
+	})
+	var snapshot FreshIdentifySnapshot
+	err = ids.withIdentifyResponse(stream, func(message *pb.Identify) error {
+		var parseErr error
+		snapshot, parseErr = freshIdentifySnapshotFromMessage(message, binding)
+		return parseErr
+	})
+	if err != nil {
+		stopCancellation()
+		if requestErr := requestCtx.Err(); requestErr != nil {
+			return FreshIdentifySnapshot{}, ids.freshOperationError(ctx, requestCtx, binding.state)
+		}
+		return FreshIdentifySnapshot{}, err
+	}
+	if stream.Conn() != c {
+		stopCancellation()
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+	return ids.deliverFreshIdentifySnapshot(ctx, requestCtx, stopCancellation, delivery, snapshot, binding)
+}
+
+type freshIdentifyConnectionBinding struct {
+	connection   network.Conn
+	connectionID string
+	localPeer    peer.ID
+	remotePeer   peer.ID
+	state        *freshIdentifyConnectionState
+}
+
+func (binding freshIdentifyConnectionBinding) valid() bool {
+	return binding.connection != nil && binding.connectionID != "" && binding.localPeer != "" &&
+		binding.remotePeer != "" && binding.state != nil
+}
+
+func (ids *idService) isTrackedFreshBinding(binding freshIdentifyConnectionBinding) bool {
+	if !binding.valid() || binding.connection.IsClosed() {
+		return false
+	}
+	ids.connsMu.RLock()
+	entry, ok := ids.conns[binding.connection]
+	valid := ok && entry.FreshState == binding.state && !binding.state.retired &&
+		!binding.connection.IsClosed() && binding.connection.ID() == binding.connectionID &&
+		binding.connection.LocalPeer() == binding.localPeer && binding.connection.RemotePeer() == binding.remotePeer
+	ids.connsMu.RUnlock()
+	return valid
+}
+
+func (ids *idService) freshOperationError(
+	caller context.Context,
+	operation context.Context,
+	state *freshIdentifyConnectionState,
+) error {
+	if err := caller.Err(); err != nil {
+		return err
+	}
+	if ids.ctx.Err() != nil || state == nil || state.ctx.Err() != nil {
+		return ErrIdentifyConnectionUnavailable
+	}
+	return operation.Err()
+}
+
+type freshIdentifyDeliveryState struct {
+	cancelled bool
+}
+
+func (ids *idService) deliverFreshIdentifySnapshot(
+	caller context.Context,
+	request context.Context,
+	stopCancellation func() bool,
+	delivery *freshIdentifyDeliveryState,
+	snapshot FreshIdentifySnapshot,
+	binding freshIdentifyConnectionBinding,
+) (FreshIdentifySnapshot, error) {
+	ids.freshLifecycle.Lock()
+	closed := ids.freshLifecycle.closed
+	ids.freshLifecycle.Unlock()
+	if closed || delivery == nil || stopCancellation == nil {
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+
+	ids.connsMu.RLock()
+	entry, tracked := ids.conns[binding.connection]
+	binding.state.gate.Lock()
+	stopped := stopCancellation()
+	valid := tracked && entry.FreshState == binding.state && !binding.state.retired &&
+		!delivery.cancelled && request.Err() == nil && binding.connection.ID() == binding.connectionID &&
+		binding.connection.LocalPeer() == binding.localPeer && binding.connection.RemotePeer() == binding.remotePeer &&
+		!binding.connection.IsClosed()
+	binding.state.gate.Unlock()
+	ids.connsMu.RUnlock()
+	if !stopped || !valid {
+		if request.Err() != nil {
+			return FreshIdentifySnapshot{}, ids.freshOperationError(caller, request, binding.state)
+		}
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+	return snapshot, nil
+}
+
+func freshIdentifySnapshotFromMessage(message *pb.Identify, binding freshIdentifyConnectionBinding) (FreshIdentifySnapshot, error) {
+	c := binding.connection
+	if message == nil || !binding.valid() || c.IsClosed() || c.ID() != binding.connectionID ||
+		c.LocalPeer() != binding.localPeer || c.RemotePeer() != binding.remotePeer {
+		return FreshIdentifySnapshot{}, ErrIdentifyConnectionUnavailable
+	}
+
+	listenAddrs := make([]ma.Multiaddr, 0, len(message.GetListenAddrs()))
+	for _, encoded := range message.GetListenAddrs() {
+		addr, err := ma.NewMultiaddrBytes(encoded)
+		if err != nil {
+			return FreshIdentifySnapshot{}, fmt.Errorf("invalid identify listen address: %w", err)
+		}
+		listenAddrs = append(listenAddrs, addr)
+	}
+	if signedRecord, err := signedPeerRecordFromMessage(message); err != nil {
+		return FreshIdentifySnapshot{}, fmt.Errorf("invalid identify signed peer record: %w", err)
+	} else if signedRecord != nil {
+		signedAddrs, err := identifyAddrsFromSignedPeerRecord(c.RemotePeer(), signedRecord)
+		if err != nil {
+			return FreshIdentifySnapshot{}, err
+		}
+		listenAddrs = signedAddrs
+	}
+	listenAddrs = filterAddrs(listenAddrs, c.RemoteMultiaddr())
+	if len(listenAddrs) > connectedPeerMaxAddrs {
+		listenAddrs = listenAddrs[:connectedPeerMaxAddrs]
+	}
+
+	var observedAddr ma.Multiaddr
+	if len(message.GetObservedAddr()) > 0 {
+		var err error
+		observedAddr, err = ma.NewMultiaddrBytes(message.GetObservedAddr())
+		if err != nil {
+			return FreshIdentifySnapshot{}, fmt.Errorf("invalid identify observed address: %w", err)
+		}
+	}
+	return FreshIdentifySnapshot{
+		PeerID:          c.RemotePeer(),
+		ConnectionID:    c.ID(),
+		ListenAddrs:     slices.Clone(listenAddrs),
+		ObservedAddr:    observedAddr,
+		Protocols:       protocol.ConvertFromStrings(message.GetProtocols()),
+		ProtocolVersion: message.GetProtocolVersion(),
+		AgentVersion:    message.GetAgentVersion(),
+	}, nil
 }
 
 // newStreamAndNegotiate opens a new stream on the given connection and negotiates the given protocol.
@@ -506,6 +776,16 @@ func (ids *idService) sendIdentifyResp(s network.Stream, isPush bool) error {
 }
 
 func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) error {
+	defer s.Close()
+	return ids.withIdentifyResponse(s, func(message *pb.Identify) error {
+		return ids.consumeIdentifyResponse(s, message, isPush)
+	})
+}
+
+func (ids *idService) withIdentifyResponse(s network.Stream, consume func(*pb.Identify) error) error {
+	if consume == nil {
+		return errors.New("identify response consumer is nil")
+	}
 	if err := s.Scope().SetService(ServiceName); err != nil {
 		log.Warn("error attaching stream to identify service", "err", err)
 		s.Reset()
@@ -519,8 +799,6 @@ func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) erro
 	}
 	defer s.Scope().ReleaseMemory(signedIDSize)
 
-	c := s.Conn()
-
 	r := pbio.NewDelimitedReader(s, signedIDSize)
 	mes := &pb.Identify{}
 
@@ -529,9 +807,11 @@ func (ids *idService) handleIdentifyResponse(s network.Stream, isPush bool) erro
 		s.Reset()
 		return err
 	}
+	return consume(mes)
+}
 
-	defer s.Close()
-
+func (ids *idService) consumeIdentifyResponse(s network.Stream, mes *pb.Identify, isPush bool) error {
+	c := s.Conn()
 	log.Debug("received identify message", "protocol", s.Protocol(), "remote_peer", c.RemotePeer(), "remote_multiaddr", c.RemoteMultiaddr())
 
 	ids.consumeMessage(mes, c, isPush)
@@ -837,6 +1117,10 @@ func (ids *idService) consumeMessage(mes *pb.Identify, c network.Conn, isPush bo
 }
 
 func (ids *idService) consumeSignedPeerRecord(p peer.ID, signedPeerRecord *record.Envelope) ([]ma.Multiaddr, error) {
+	return identifyAddrsFromSignedPeerRecord(p, signedPeerRecord)
+}
+
+func identifyAddrsFromSignedPeerRecord(p peer.ID, signedPeerRecord *record.Envelope) ([]ma.Multiaddr, error) {
 	if signedPeerRecord.PublicKey == nil {
 		return nil, errors.New("missing pubkey")
 	}
@@ -999,7 +1283,14 @@ func (ids *idService) addConnWithLock(c network.Conn) {
 	_, found := ids.conns[c]
 	if !found {
 		<-ids.setupCompleted
-		ids.conns[c] = entry{}
+		ctx, cancel := context.WithCancel(ids.ctx)
+		token := make(chan struct{}, 1)
+		token <- struct{}{}
+		ids.conns[c] = entry{FreshState: &freshIdentifyConnectionState{
+			ctx:    ctx,
+			cancel: cancel,
+			token:  token,
+		}}
 	}
 }
 
@@ -1033,7 +1324,14 @@ func (nn *netNotifiee) Disconnected(_ network.Network, c network.Conn) {
 
 	// Stop tracking the connection.
 	ids.connsMu.Lock()
+	e, found := ids.conns[c]
 	delete(ids.conns, c)
+	if found && e.FreshState != nil {
+		e.FreshState.gate.Lock()
+		e.FreshState.retired = true
+		e.FreshState.cancel()
+		e.FreshState.gate.Unlock()
+	}
 	ids.connsMu.Unlock()
 
 	// Last disconnect.
