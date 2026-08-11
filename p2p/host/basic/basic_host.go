@@ -531,11 +531,15 @@ func (h *BasicHost) preferredProtocol(p peer.ID, pids []protocol.ID) (protocol.I
 // Connect ensures there is a connection between this host and the peer with
 // given peer.ID. If there is not an active connection, Connect will issue a
 // h.Network.Dial, and block until a connection is open, or an error is returned.
-// Connect will absorb the addresses in pi into its internal peerstore.
+// Connect will absorb the addresses in pi into its internal peerstore unless
+// network.WithDialPeerAddrs is present on ctx.
 // It will also resolve any /dns4, /dns6, and /dnsaddr addresses.
 func (h *BasicHost) Connect(ctx context.Context, pi peer.AddrInfo) error {
-	// absorb addresses into peerstore
-	h.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
+	// Ephemeral address callers retain source/TTL ownership outside the shared
+	// peerstore. Swarm consumes the same context option for this one dial.
+	if _, ephemeral := network.GetDialPeerAddrs(ctx); !ephemeral {
+		h.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
+	}
 
 	forceDirect, _ := network.GetForceDirectDial(ctx)
 	canUseLimitedConn, _ := network.GetAllowLimitedConn(ctx)

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -56,4 +57,20 @@ func TestSimultaneousConnect(t *testing.T) {
 		require.True(t, isClient)
 		require.Equal(t, "foo", reason)
 	})
+}
+
+func TestDialPeerAddrsContextCopiesAddresses(t *testing.T) {
+	input := []ma.Multiaddr{ma.StringCast("/ip4/192.0.2.1/tcp/4001")}
+	ctx := WithDialPeerAddrs(context.Background(), input)
+	input[0] = ma.StringCast("/ip4/192.0.2.2/tcp/4001")
+
+	got, ok := GetDialPeerAddrs(ctx)
+	if !ok || len(got) != 1 || got[0].String() != "/ip4/192.0.2.1/tcp/4001" {
+		t.Fatalf("dial addresses = %v, present=%t", got, ok)
+	}
+	got[0] = ma.StringCast("/ip4/192.0.2.3/tcp/4001")
+	again, ok := GetDialPeerAddrs(ctx)
+	if !ok || again[0].String() != "/ip4/192.0.2.1/tcp/4001" {
+		t.Fatalf("context addresses changed through result mutation: %v", again)
+	}
 }

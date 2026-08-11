@@ -3,6 +3,8 @@ package network
 import (
 	"context"
 	"time"
+
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // DialPeerTimeout is the default timeout for a single call to `DialPeer`. When
@@ -14,11 +16,13 @@ type noDialCtxKey struct{}
 type dialPeerTimeoutCtxKey struct{}
 type forceDirectDialCtxKey struct{}
 type allowLimitedConnCtxKey struct{}
+type dialPeerAddrsCtxKey struct{}
 type simConnectCtxKey struct{ isClient bool }
 
 var noDial = noDialCtxKey{}
 var forceDirectDial = forceDirectDialCtxKey{}
 var allowLimitedConn = allowLimitedConnCtxKey{}
+var dialPeerAddrs = dialPeerAddrsCtxKey{}
 var simConnectIsServer = simConnectCtxKey{}
 var simConnectIsClient = simConnectCtxKey{isClient: true}
 
@@ -127,4 +131,43 @@ func GetUseTransient(ctx context.Context) (usetransient bool, reason string) {
 		return true, v.(string)
 	}
 	return false, ""
+}
+
+// WithDialPeerAddrs supplies addresses for one dial without allowing the dial
+// path to persist them in the peerstore. It is intended for callers that own
+// address validity outside the peerstore.
+//
+// EXPERIMENTAL: both BasicHost and Swarm must support this option for it to
+// prevent peerstore writes.
+func WithDialPeerAddrs(ctx context.Context, addrs []ma.Multiaddr) context.Context {
+	cloned := make([]ma.Multiaddr, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr == nil {
+			continue
+		}
+		copyAddr, err := ma.NewMultiaddrBytes(addr.Bytes())
+		if err == nil {
+			cloned = append(cloned, copyAddr)
+		}
+	}
+	return context.WithValue(ctx, dialPeerAddrs, cloned)
+}
+
+// GetDialPeerAddrs returns an isolated copy of one-dial ephemeral addresses.
+func GetDialPeerAddrs(ctx context.Context) ([]ma.Multiaddr, bool) {
+	addrs, ok := ctx.Value(dialPeerAddrs).([]ma.Multiaddr)
+	if !ok {
+		return nil, false
+	}
+	cloned := make([]ma.Multiaddr, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr == nil {
+			continue
+		}
+		copyAddr, err := ma.NewMultiaddrBytes(addr.Bytes())
+		if err == nil {
+			cloned = append(cloned, copyAddr)
+		}
+	}
+	return cloned, true
 }

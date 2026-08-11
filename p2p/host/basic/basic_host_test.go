@@ -82,6 +82,43 @@ func TestHostSimple(t *testing.T) {
 	require.Equal(t, buf1, buf3)
 }
 
+func TestConnectWithEphemeralDialAddrsDoesNotPersistFailedDial(t *testing.T) {
+	h1, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	defer h1.Close()
+	h1.Start()
+
+	h2, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	h2.Start()
+	peerInfo := h2.Peerstore().PeerInfo(h2.ID())
+	require.NotEmpty(t, peerInfo.Addrs)
+	require.NoError(t, h2.Close())
+
+	ctx, cancel := context.WithTimeout(network.WithDialPeerAddrs(context.Background(), peerInfo.Addrs), time.Second)
+	defer cancel()
+	require.Error(t, h1.Connect(ctx, peerInfo))
+	require.Empty(t, h1.Peerstore().Addrs(peerInfo.ID), "a failed ephemeral dial must not persist its supplied addresses")
+}
+
+func TestConnectWithEphemeralDialAddrsUsesOnlyContextAddresses(t *testing.T) {
+	h1, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	defer h1.Close()
+	h1.Start()
+
+	h2, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	defer h2.Close()
+	h2.Start()
+	peerInfo := h2.Peerstore().PeerInfo(h2.ID())
+	require.NotEmpty(t, peerInfo.Addrs)
+
+	ctx, cancel := context.WithTimeout(network.WithDialPeerAddrs(context.Background(), peerInfo.Addrs), time.Second)
+	defer cancel()
+	require.NoError(t, h1.Connect(ctx, peer.AddrInfo{ID: peerInfo.ID}), "Connect must use context addresses, not pi.Addrs or peerstore")
+}
+
 func TestMultipleClose(t *testing.T) {
 	h, err := NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)

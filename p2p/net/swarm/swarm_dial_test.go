@@ -73,6 +73,30 @@ func TestAddrsForDial(t *testing.T) {
 	require.NotZero(t, len(mas))
 }
 
+func TestEphemeralDialAddrsDoNotUseOrWritePeerstore(t *testing.T) {
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	id, err := peer.IDFromPrivateKey(priv)
+	require.NoError(t, err)
+	ps, err := pstoremem.NewPeerstore()
+	require.NoError(t, err)
+	t.Cleanup(func() { ps.Close() })
+
+	s, err := NewSwarm(id, ps, eventbus.NewBus())
+	require.NoError(t, err)
+	defer s.Close()
+	transport, err := tcp.NewTCPTransport(nil, &network.NullResourceManager{}, nil)
+	require.NoError(t, err)
+	require.NoError(t, s.AddTransport(transport))
+
+	target := test.RandPeerIDFatal(t)
+	ephemeral := ma.StringCast("/ip4/192.0.2.1/tcp/4001")
+	addrs, _, err := s.addrsForDial(network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{ephemeral}), target)
+	require.NoError(t, err)
+	require.Equal(t, []ma.Multiaddr{ephemeral}, addrs)
+	require.Empty(t, ps.Addrs(target), "ephemeral dial must not populate the shared peerstore")
+}
+
 func TestDedupAddrsForDial(t *testing.T) {
 	mockResolver := madns.MockResolver{IP: make(map[string][]net.IPAddr)}
 	ipaddr, err := net.ResolveIPAddr("ip4", "1.2.3.4")

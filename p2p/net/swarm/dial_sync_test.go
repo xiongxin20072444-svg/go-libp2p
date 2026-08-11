@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/stretchr/testify/require"
 )
@@ -159,6 +161,94 @@ func TestDialSyncAllCancel(t *testing.T) {
 	if _, err := dsync.Dial(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestDialSyncRejectsConcurrentDifferentEphemeralDialSets(t *testing.T) {
+	df, done, _, started := getMockDialFunc()
+	dsync := newDialSync(df)
+	target := peer.ID("testpeer")
+	firstDone := make(chan error, 1)
+	firstContext := network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{ma.StringCast("/ip4/192.0.2.1/tcp/4001")})
+	go func() {
+		_, err := dsync.Dial(firstContext, target)
+		firstDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not start")
+	}
+	secondContext := network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{ma.StringCast("/ip4/192.0.2.2/tcp/4001")})
+	_, err := dsync.Dial(secondContext, target)
+	require.ErrorIs(t, err, errConcurrentDialAddressSetConflict)
+	done()
+	require.NoError(t, <-firstDone)
+}
+
+func TestDialSyncCoalescesConcurrentMatchingEphemeralDialSets(t *testing.T) {
+	df, done, _, started := getMockDialFunc()
+	dsync := newDialSync(df)
+	target := peer.ID("testpeer")
+	firstDone := make(chan error, 1)
+	firstContext := network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{ma.StringCast("/ip4/192.0.2.1/tcp/4001")})
+	go func() {
+		_, err := dsync.Dial(firstContext, target)
+		firstDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not start")
+	}
+	secondDone := make(chan error, 1)
+	secondContext := network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{ma.StringCast("/ip4/192.0.2.1/tcp/4001")})
+	go func() {
+		_, err := dsync.Dial(secondContext, target)
+		secondDone <- err
+	}()
+	done()
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+}
+
+func TestDialSyncRejectsEphemeralDialSetWithDuplicateAddress(t *testing.T) {
+	df, done, _, started := getMockDialFunc()
+	dsync := newDialSync(df)
+	target := peer.ID("testpeer")
+	firstDone := make(chan error, 1)
+	firstContext := network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{
+		ma.StringCast("/ip4/192.0.2.1/tcp/4001"),
+		ma.StringCast("/ip4/192.0.2.2/tcp/4001"),
+	})
+	go func() {
+		_, err := dsync.Dial(firstContext, target)
+		firstDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not start")
+	}
+	duplicateContext := network.WithDialPeerAddrs(context.Background(), []ma.Multiaddr{
+		ma.StringCast("/ip4/192.0.2.1/tcp/4001"),
+		ma.StringCast("/ip4/192.0.2.1/tcp/4001"),
+	})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := dsync.Dial(duplicateContext, target)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		require.ErrorIs(t, err, errConcurrentDialAddressSetConflict)
+	case <-time.After(time.Second):
+		done()
+		require.NoError(t, <-firstDone)
+		require.NoError(t, <-secondDone)
+		t.Fatal("duplicate ephemeral set joined the active dial")
+	}
+	done()
+	require.NoError(t, <-firstDone)
 }
 
 func TestFailFirst(t *testing.T) {
