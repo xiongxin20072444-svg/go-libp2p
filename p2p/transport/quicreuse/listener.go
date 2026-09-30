@@ -150,6 +150,10 @@ func (l *quicListener) Run() error {
 			if errors.Is(err, quic.ErrServerClosed) || strings.Contains(err.Error(), "use of closed network connection") {
 				return transport.ErrListenerClosed
 			}
+			if tr, ok := l.transport.(*refcountedTransport); ok && isTransportFailure(err) {
+				log.Warn("closing QUIC transport after socket failure", "laddr", tr.LocalAddr(), "err", err)
+				tr.markDead()
+			}
 			return err
 		}
 		proto := conn.ConnectionState().TLS.NegotiatedProtocol
@@ -169,6 +173,25 @@ func (l *quicListener) Close() error {
 	err := l.l.Close()
 	<-l.running // wait for Run to return
 	return err
+}
+
+// isTransportFailure reports whether err means the QUIC Transport shut down
+// because reading from its socket failed. A deliberate close carries no cause
+// or a net.ErrClosed cause and is not a failure.
+func isTransportFailure(err error) bool {
+	if !errors.Is(err, quic.ErrTransportClosed) {
+		return false
+	}
+	var closed interface{ Unwrap() []error }
+	if !errors.As(err, &closed) {
+		return false
+	}
+	for _, cause := range closed.Unwrap() {
+		if cause != nil && !errors.Is(cause, net.ErrClosed) {
+			return true
+		}
+	}
+	return false
 }
 
 const queueLen = 16

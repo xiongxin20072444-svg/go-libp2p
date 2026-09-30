@@ -80,6 +80,10 @@ type refcountedTransport struct {
 	mutex       sync.Mutex
 	refCount    int
 	unusedSince time.Time
+	// dead is set once the underlying socket failed permanently. A dead
+	// transport is already closed and is dropped from the reuse maps on the
+	// next lookup instead of waiting for garbage collection.
+	dead bool
 
 	// Only set for transports we are borrowing.
 	// If set, we will _never_ close the underlying transport. We only close this
@@ -175,6 +179,29 @@ func (c *refcountedTransport) DecreaseCount() {
 	c.mutex.Unlock()
 }
 
+// markDead closes a transport whose QUIC Transport shut down after a permanent
+// read error on its socket, e.g. when Android destroys the sockets of a frozen
+// app. Without this, the dead transport stays in the reuse maps until garbage
+// collection (up to maxUnusedDuration + garbageCollectInterval): dials keep
+// selecting it and fail, and listening on the same port again fails with
+// "address already in use" because the socket is still bound.
+func (c *refcountedTransport) markDead() {
+	c.mutex.Lock()
+	if c.dead {
+		c.mutex.Unlock()
+		return
+	}
+	c.dead = true
+	c.mutex.Unlock()
+	c.Close()
+}
+
+func (c *refcountedTransport) isDead() bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.dead
+}
+
 func (c *refcountedTransport) ShouldGarbageCollect(now time.Time) bool {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
@@ -225,9 +252,34 @@ func newReuse(srk *quic.StatelessResetKey, tokenKey *quic.TokenGeneratorKey, lis
 	return r
 }
 
+// dropDeadLocked removes transports that were already closed by markDead.
+func (r *reuse) dropDeadLocked() {
+	for key, tr := range r.globalListeners {
+		if tr.isDead() {
+			delete(r.globalListeners, key)
+		}
+	}
+	for key, tr := range r.globalDialers {
+		if tr.isDead() {
+			delete(r.globalDialers, key)
+		}
+	}
+	for ukey, trs := range r.unicast {
+		for key, tr := range trs {
+			if tr.isDead() {
+				delete(trs, key)
+			}
+		}
+		if len(trs) == 0 {
+			delete(r.unicast, ukey)
+		}
+	}
+}
+
 func (r *reuse) gc() {
 	defer func() {
 		r.mutex.Lock()
+		r.dropDeadLocked()
 		for _, tr := range r.globalListeners {
 			tr.Close()
 		}
@@ -252,6 +304,7 @@ func (r *reuse) gc() {
 		case <-ticker.C:
 			now := time.Now()
 			r.mutex.Lock()
+			r.dropDeadLocked()
 			for key, tr := range r.globalListeners {
 				if tr.ShouldGarbageCollect(now) {
 					tr.Close()
@@ -318,6 +371,7 @@ func (r *reuse) TransportWithAssociationForDial(association any, network string,
 }
 
 func (r *reuse) transportForDialLocked(association any, network string, source *net.IP) (*refcountedTransport, error) {
+	r.dropDeadLocked()
 	if source != nil {
 		// We already have at least one suitable transport...
 		if trs, ok := r.unicast[source.String()]; ok {
@@ -387,6 +441,7 @@ func (r *reuse) AddTransport(tr *refcountedTransport, laddr *net.UDPAddr) error 
 func (r *reuse) TransportForListen(network string, laddr *net.UDPAddr) (*refcountedTransport, error) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+	r.dropDeadLocked()
 
 	// Check if we can reuse a transport we have already dialed out from.
 	// We reuse a transport from globalDialers when the requested port is 0 or the requested

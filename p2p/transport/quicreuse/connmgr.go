@@ -334,6 +334,9 @@ func (c *ConnManager) DialQUIC(ctx context.Context, raddr ma.Multiaddr, tlsConf 
 	}
 	conn, err := tr.Dial(ctx, naddr, tlsConf, quicConf)
 	if err != nil {
+		if rt, ok := tr.(*refcountedTransport); ok && isTransportFailure(err) {
+			rt.markDead()
+		}
 		tr.DecreaseCount()
 		return nil, err
 	}
