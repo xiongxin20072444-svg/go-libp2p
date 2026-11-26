@@ -591,7 +591,7 @@ func (rf *relayFinder) maybeConnectToRelay(ctx context.Context) {
 	}
 
 	rf.candidateMx.Lock()
-	if len(rf.relays) == 0 && len(rf.candidates) < rf.conf.minCandidates && rf.conf.clock.Since(rf.bootTime) < rf.conf.bootDelay {
+	if numRelays == 0 && len(rf.candidates) < rf.conf.minCandidates && rf.conf.clock.Since(rf.bootTime) < rf.conf.bootDelay {
 		// During the startup phase, we don't want to connect to the first candidate that we find.
 		// Instead, we wait until we've found at least minCandidates, and then select the best of those.
 		// However, if that takes too long (longer than bootDelay), we still go ahead.
